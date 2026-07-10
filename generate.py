@@ -5,18 +5,84 @@ The LLM itself is instructed (and structurally constrained via
 response_format) to return JSON directly - not a plain-text answer
 that we wrap into JSON afterward. This is genuine structured output
 prompting (Concept 206), not string formatting.
+
+Includes:
+- Retry logic with exponential backoff for transient API failures
+- Graceful degradation (structured error result, not a crash) if
+  retries are exhausted
+- Concurrency-safe output filenames (microsecond precision + UUID,
+  preventing collisions if two requests complete in the same second)
+- Structured logging of latency, retrieval scores, and disagreement
+  rate for ongoing observability
 """
 
 import os
 import json
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from groq import Groq
+from groq import Groq, APIConnectionError, APITimeoutError, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
+from logging_utils import log_query_event
 
 load_dotenv()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+MAX_RETRIES = 3
+BASE_BACKOFF_SECONDS = 2
+
+
+def _call_groq_with_retry(messages: list, model: str, temperature: float, max_tokens: int) -> dict:
+    """
+    Wraps a Groq chat completion call with retry logic and exponential
+    backoff, specifically for transient failures - rate limits, timeouts,
+    and connection errors. Non-transient errors (e.g. auth failures,
+    invalid requests) are NOT retried, since retrying those would just
+    waste time on a failure that will never succeed.
+    """
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"}
+            )
+            return {"success": True, "content": response.choices[0].message.content}
+
+        except RateLimitError as e:
+            last_error = f"Rate limited by Groq: {e}"
+            wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(f"  [Retry {attempt}/{MAX_RETRIES}] Rate limited, waiting {wait}s before retry...")
+            time.sleep(wait)
+
+        except APITimeoutError as e:
+            last_error = f"Groq request timed out: {e}"
+            wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(f"  [Retry {attempt}/{MAX_RETRIES}] Timeout, waiting {wait}s before retry...")
+            time.sleep(wait)
+
+        except APIConnectionError as e:
+            last_error = f"Connection error reaching Groq: {e}"
+            wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(f"  [Retry {attempt}/{MAX_RETRIES}] Connection error, waiting {wait}s before retry...")
+            time.sleep(wait)
+
+        except APIStatusError as e:
+            if e.status_code and 500 <= e.status_code < 600:
+                last_error = f"Groq server error ({e.status_code}): {e}"
+                wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                print(f"  [Retry {attempt}/{MAX_RETRIES}] Server error {e.status_code}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                return {"success": False, "error": f"Groq client error ({e.status_code}): {e}"}
+
+    return {"success": False, "error": f"Exhausted {MAX_RETRIES} retries. Last error: {last_error}"}
 
 
 def build_prompt(query: str, retrieved_chunks: list) -> str:
@@ -58,29 +124,32 @@ Return ONLY the JSON object, no other text before or after it."""
 
     return prompt
 
+
 def generate_answer(query: str, retrieved_chunks: list, model: str = "llama-3.1-8b-instant") -> dict:
     """
-    Returns the model's own structured JSON output as a parsed dict,
-    not a plain string.
+    Returns the model's own structured JSON output as a parsed dict.
+
+    If the API call fails after all retries, returns a graceful
+    fallback dict rather than raising an exception.
     """
     prompt = build_prompt(query, retrieved_chunks)
+    messages = [{"role": "user", "content": prompt}]
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=400,
-        response_format={"type": "json_object"}  # structurally enforces valid JSON output
-    )
+    result = _call_groq_with_retry(messages, model=model, temperature=0.3, max_tokens=400)
 
-    raw_content = response.choices[0].message.content
+    if not result["success"]:
+        return {
+            "answer": "Unable to generate an answer - the generation service is currently unavailable.",
+            "context_sufficient": None,
+            "sources_referenced": [],
+            "_api_error": result["error"]
+        }
+
+    raw_content = result["content"]
 
     try:
         parsed = json.loads(raw_content)
     except json.JSONDecodeError:
-        # Fallback if the model somehow still returns malformed JSON -
-        # surface this as a real, visible failure rather than silently
-        # hiding it behind a fabricated structure
         parsed = {
             "answer": raw_content,
             "context_sufficient": None,
@@ -94,9 +163,9 @@ def generate_answer(query: str, retrieved_chunks: list, model: str = "llama-3.1-
 def verify_faithfulness(answer: str, retrieved_chunks: list, model: str = "llama-3.1-8b-instant") -> dict:
     """
     Independent faithfulness check - a SEPARATE call from the generation
-    call, specifically asked to verify whether the answer's claims can
-    be found in the context, without any framing pressure to produce
-    a "real" answer. RAGAS-style separate-judge pattern.
+    call. Fails SAFE if the API call itself fails: treats unverifiable
+    as faithful=False, triggering the override rather than risking an
+    unverified answer reaching the user.
     """
     context_text = "\n\n".join(c["chunk"] for c in retrieved_chunks)
 
@@ -115,15 +184,17 @@ claims are traceable to specific text in the context above.
 Respond with JSON:
 {{"faithful": <true or false>, "evidence": "<quote the exact context text that supports the answer, or state 'no supporting text found'>"}}"""
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": verify_prompt}],
-        temperature=0.0,
-        max_tokens=200,
-        response_format={"type": "json_object"}
-    )
+    messages = [{"role": "user", "content": verify_prompt}]
+    result = _call_groq_with_retry(messages, model=model, temperature=0.0, max_tokens=200)
 
-    return json.loads(response.choices[0].message.content)
+    if not result["success"]:
+        return {
+            "faithful": False,
+            "evidence": "Verification unavailable - failing safe (treating as unverified).",
+            "_api_error": result["error"]
+        }
+
+    return json.loads(result["content"])
 
 
 def run_and_save(
@@ -132,31 +203,31 @@ def run_and_save(
     model: str = "llama-3.1-8b-instant",
     output_dir: str = "outputs"
 ) -> dict:
+    """
+    Runs generation, independent faithfulness verification (skipped
+    when self-report already refused), logs the query event, and
+    saves a structured JSON result with a concurrency-safe filename.
+    """
+    gen_start = time.time()
     model_output = generate_answer(query, retrieved_chunks, model=model)
+    gen_latency = time.time() - gen_start
 
-    # If the generator ITSELF already reported insufficient context,
-    # there's no substantive claim to fact-check - running the
-    # claim-verification prompt against a refusal produces awkward,
-    # semantically-mismatched reasoning (as observed with the asyncio
-    # case). Skip straight to a clean, honest "trivially faithful"
-    # result, and treat this as NO disagreement, since self-report
-    # and the final outcome already agree in this branch.
     self_reported_sufficient = model_output.get("context_sufficient")
 
+    verify_start = time.time()
     if self_reported_sufficient is False:
         faithfulness_check = {
             "faithful": True,
             "evidence": "Generator already reported insufficient context; no substantive claim was made to verify."
         }
-        disagreement = False  # Nothing to disagree about - both already agree it's insufficient
+        disagreement = False
     else:
-        # This is the case that actually matters for catching hallucination -
-        # generator claimed sufficiency, so verify that claim independently.
         faithfulness_check = verify_faithfulness(
             model_output.get("answer", ""), retrieved_chunks, model=model
         )
         is_faithful_check = faithfulness_check.get("faithful", False)
         disagreement = (self_reported_sufficient != is_faithful_check)
+    verify_latency = time.time() - verify_start
 
     is_faithful = faithfulness_check.get("faithful", False)
 
@@ -166,6 +237,21 @@ def run_and_save(
         final_answer = ("The retrieved context does not contain sufficient information "
                          "to answer this question. (Independent verification overrode the "
                          "generator's own claim of sufficiency.)")
+
+    had_api_error = "_api_error" in model_output or "_api_error" in faithfulness_check
+    top_score = retrieved_chunks[0]["score"] if retrieved_chunks else 0.0
+
+    # NOTE: retrieval happens before this function is called (in the
+    # caller's code - test scripts, app.py), so retrieval_latency_s is
+    # not measured here. Stated explicitly rather than faking a number.
+    log_query_event(
+        query=query,
+        retrieval_latency_s=0.0,
+        generation_latency_s=gen_latency + verify_latency,
+        top_retrieval_score=top_score,
+        self_report_disagreement=disagreement,
+        had_api_error=had_api_error
+    )
 
     result = {
         "query": query,
@@ -184,13 +270,18 @@ def run_and_save(
         "model_response": model_output,
         "faithfulness_check": faithfulness_check,
         "final_answer": final_answer,
-        "self_report_disagreement": disagreement
+        "self_report_disagreement": disagreement,
+        "had_api_error": had_api_error
     }
 
     Path(output_dir).mkdir(exist_ok=True)
     safe_query_slug = "".join(c if c.isalnum() else "_" for c in query[:40]).strip("_")
-    timestamp_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = Path(output_dir) / f"{timestamp_slug}_{safe_query_slug}.json"
+
+    # Microsecond precision + random suffix - eliminates filename
+    # collision risk if two requests complete within the same second.
+    timestamp_slug = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique_suffix = uuid.uuid4().hex[:6]
+    output_path = Path(output_dir) / f"{timestamp_slug}_{unique_suffix}_{safe_query_slug}.json"
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
@@ -211,6 +302,8 @@ def print_result(result: dict):
     print("=" * 60)
     print(f"Answer: {result['model_response'].get('answer')}")
     print(f"Context sufficient (self-reported): {result['model_response'].get('context_sufficient')}")
+    if "_api_error" in result["model_response"]:
+        print(f"API ERROR encountered: {result['model_response']['_api_error']}")
 
     print("\n" + "=" * 60)
     print("INDEPENDENT FAITHFULNESS CHECK (authoritative)")
@@ -218,15 +311,19 @@ def print_result(result: dict):
     fc = result["faithfulness_check"]
     print(f"Faithful (verified separately): {fc.get('faithful')}")
     print(f"Evidence: {fc.get('evidence')}")
+    if "_api_error" in fc:
+        print(f"API ERROR encountered: {fc['_api_error']}")
 
     print("\n" + "=" * 60)
     print("FINAL ANSWER (after override, this is what a user would see)")
     print("=" * 60)
     print(result.get("final_answer", "(final_answer not computed - check run_and_save)"))
     print(f"\nSelf-report disagreed with independent check: {result.get('self_report_disagreement')}")
+    print(f"Had API error during this run: {result.get('had_api_error')}")
 
     if "_saved_to" in result:
         print(f"\nSaved JSON result to: {result['_saved_to']}")
+
 
 if __name__ == "__main__":
     import sys

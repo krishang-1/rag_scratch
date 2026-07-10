@@ -6,3 +6,5 @@ __pycache__/
 archive/__pycache__/
 data/raw/*_files/
 index_cache/
+logs/
+daily_request_count.json

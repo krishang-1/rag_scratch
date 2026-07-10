@@ -1,0 +1,7 @@
+.env
+outputs/
+__pycache__/
+*.pyc
+.cache/
+archive/__pycache__/
+data/raw/*_files/

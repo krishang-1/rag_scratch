@@ -1,12 +1,14 @@
 """
-Full RAG retrieval pipeline with parent-document retrieval:
-embed small sub-chunks for precision, but return the FULL original
-entry as context - so a query matching a peripheral fragment still
-surfaces the complete, relevant information. Also carries entry_name
-metadata through for entry-level recall evaluation.
+Full RAG retrieval pipeline with parent-document retrieval and
+INDEX PERSISTENCE: the chunk/embed/index steps only run when the
+source documents in data/raw/ have actually changed (detected via
+content hash), rather than on every single script invocation.
 """
 
 import sys
+import hashlib
+from pathlib import Path
+
 sys.path.insert(0, "modules")
 
 from dom_chunking import load_and_chunk_all
@@ -15,6 +17,22 @@ from embedding import EmbeddingModel
 from vector_store_faiss import FaissVectorStore
 
 MAX_CHARS_SAFE = 900
+INDEX_CACHE_DIR = "index_cache"
+
+
+def compute_corpus_hash(raw_dir: str = "data/raw") -> str:
+    """
+    Hashes the combined content of every .html file in raw_dir, sorted
+    by filename for determinism. If any file changes, is added, or is
+    removed, this hash changes - which is how we detect the cached
+    index is stale and needs rebuilding.
+    """
+    hasher = hashlib.sha256()
+    html_files = sorted(Path(raw_dir).glob("*.html"))
+    for file_path in html_files:
+        hasher.update(file_path.name.encode())
+        hasher.update(file_path.read_bytes())
+    return hasher.hexdigest()
 
 
 def cap_oversized_chunks_with_parent(chunk_records: list, max_chars: int = MAX_CHARS_SAFE) -> list:
@@ -59,9 +77,10 @@ def dedupe_by_parent(results: list) -> list:
     return deduped
 
 
-def build_pipeline():
+def _build_fresh(raw_dir: str = "data/raw"):
+    """Runs the full chunk -> cap -> embed -> index pipeline from scratch."""
     print("Step 1: DOM-chunking real documentation...")
-    raw_records = load_and_chunk_all()
+    raw_records = load_and_chunk_all(raw_dir)
     print(f"  {len(raw_records)} raw chunks\n")
 
     print("Step 2: Capping oversized chunks (tracking parent text + entry names)...")
@@ -86,8 +105,39 @@ def build_pipeline():
         for r in records
     ]
     parent_texts = [r["parent_text"] for r in records]
-    store.add(vectors, parent_texts, metadata)  # storing parent_text as the retrievable "chunk"
+    store.add(vectors, parent_texts, metadata)
     print(f"  Index built with {len(chunks_text)} vectors\n")
+
+    return store, model
+
+
+def build_pipeline(raw_dir: str = "data/raw", force_rebuild: bool = False):
+    """
+    Returns (store, embed_model). Loads from index_cache/ if a valid,
+    up-to-date cache exists; otherwise rebuilds from scratch and saves
+    the new result for next time.
+    """
+    current_hash = compute_corpus_hash(raw_dir)
+    hash_file = Path(INDEX_CACHE_DIR) / "corpus_hash.txt"
+
+    if not force_rebuild and hash_file.exists():
+        saved_hash = hash_file.read_text().strip()
+        if saved_hash == current_hash:
+            cached_store = FaissVectorStore.load(INDEX_CACHE_DIR)
+            if cached_store is not None:
+                print(f"Loaded cached index ({len(cached_store.chunks)} vectors) - "
+                      f"corpus unchanged, skipping rebuild.\n")
+                model = EmbeddingModel()  # still need the model loaded for query embedding
+                return cached_store, model
+        else:
+            print("Corpus has changed since last cached index - rebuilding.\n")
+
+    store, model = _build_fresh(raw_dir)
+
+    Path(INDEX_CACHE_DIR).mkdir(exist_ok=True)
+    store.save(INDEX_CACHE_DIR)
+    (Path(INDEX_CACHE_DIR) / "corpus_hash.txt").write_text(current_hash)
+    print(f"Saved index to {INDEX_CACHE_DIR}/ for future runs.\n")
 
     return store, model
 

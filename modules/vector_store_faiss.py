@@ -1,10 +1,13 @@
 """
-Phase 3B: FAISS-based vector search - same operation as Phase 3A,
-swapped in for comparison. FAISS uses approximate/optimized search
-under the hood; at small scale it should return identical top-k
-results to the brute-force version.
+FAISS-based vector search - exact search via inner product (cosine
+similarity, since vectors are normalized before indexing).
+
+Includes save/load support so the index doesn't need to be rebuilt
+from scratch on every script run.
 """
 
+import pickle
+from pathlib import Path
 import numpy as np
 import faiss
 
@@ -12,11 +15,6 @@ import faiss
 class FaissVectorStore:
     def __init__(self, dim: int):
         self.dim = dim
-        # IndexFlatIP = exact search via inner product (dot product).
-        # Since we normalize vectors first, inner product == cosine similarity.
-        # This is FAISS's "exact" index - genuinely comparable to brute-force,
-        # not yet using approximate methods like HNSW (that's the next step
-        # if we wanted to test the accuracy/speed tradeoff explicitly).
         self.index = faiss.IndexFlatIP(dim)
         self.chunks = []
         self.metadata = []
@@ -35,6 +33,8 @@ class FaissVectorStore:
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:  # FAISS returns -1 for unfilled slots if fewer than top_k exist
+                continue
             results.append({
                 "chunk": self.chunks[idx],
                 "score": float(score),
@@ -42,48 +42,36 @@ class FaissVectorStore:
             })
         return results
 
+    def save(self, save_dir: str = "index_cache"):
+        """Persists the FAISS index and parallel chunks/metadata lists to disk."""
+        save_path = Path(save_dir)
+        save_path.mkdir(exist_ok=True)
 
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, ".")
-    from embedding import EmbeddingModel
-    from vector_store import NaiveVectorStore
-    import time
+        faiss.write_index(self.index, str(save_path / "index.faiss"))
 
-    model = EmbeddingModel()
+        with open(save_path / "chunks_metadata.pkl", "wb") as f:
+            pickle.dump({
+                "chunks": self.chunks,
+                "metadata": self.metadata,
+                "dim": self.dim
+            }, f)
 
-    sample_chunks = [
-        "The lru_cache decorator caches function return values.",
-        "Python's asyncio module handles asynchronous programming.",
-        "The weather today is sunny with clear skies.",
-        "functools.reduce applies a function cumulatively to items.",
-    ]
+    @classmethod
+    def load(cls, save_dir: str = "index_cache"):
+        """Loads a previously saved FAISS index and chunks/metadata. Returns None if not found."""
+        save_path = Path(save_dir)
+        index_file = save_path / "index.faiss"
+        pkl_file = save_path / "chunks_metadata.pkl"
 
-    vectors = model.embed(sample_chunks)
-    metadata = [{"source": "test.txt"} for _ in sample_chunks]
+        if not index_file.exists() or not pkl_file.exists():
+            return None
 
-    query = "How do I cache function results in Python?"
-    query_vec = model.embed_one(query)
+        with open(pkl_file, "rb") as f:
+            data = pickle.load(f)
 
-    # --- Naive (Phase 3A) ---
-    naive_store = NaiveVectorStore()
-    naive_store.add(vectors, sample_chunks, metadata)
-    naive_results = naive_store.search(query_vec, top_k=2)
+        store = cls(dim=data["dim"])
+        store.index = faiss.read_index(str(index_file))
+        store.chunks = data["chunks"]
+        store.metadata = data["metadata"]
 
-    # --- FAISS (Phase 3B) ---
-    faiss_store = FaissVectorStore(dim=model.dim)
-    faiss_store.add(vectors, sample_chunks, metadata)
-    faiss_results = faiss_store.search(query_vec, top_k=2)
-
-    print("=== Naive (brute-force) results ===")
-    for r in naive_results:
-        print(f"  Score: {r['score']:.4f} | {r['chunk']}")
-
-    print("\n=== FAISS results ===")
-    for r in faiss_results:
-        print(f"  Score: {r['score']:.4f} | {r['chunk']}")
-
-    # Verify they match
-    naive_top_chunk = naive_results[0]["chunk"]
-    faiss_top_chunk = faiss_results[0]["chunk"]
-    print(f"\nTop result matches: {naive_top_chunk == faiss_top_chunk}")
+        return store

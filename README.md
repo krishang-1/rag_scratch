@@ -9,7 +9,7 @@
 
 A retrieval-augmented generation system built from first principles, with a specific focus on **verified correctness** at every stage not just "it retrieves and generates," but retrieval that's been stress-tested, and generation whose faithfulness is independently checked rather than trusted on the model's own word.
 
-**[Live demo(https://python-rag-scratch.streamlit.app/)]** &nbsp;
+**[Live demo](https://python-rag-scratch.streamlit.app/)** &nbsp;
 
 ---
 

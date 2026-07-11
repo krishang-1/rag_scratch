@@ -4,3 +4,7 @@ faiss-cpu
 groq
 beautifulsoup4
 streamlit
+filelock
+pytest
+python-dotenv
+rank_bm25

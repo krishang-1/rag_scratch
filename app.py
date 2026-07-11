@@ -15,9 +15,12 @@ Security, layered:
      foolproof, this is defense-in-depth for a portfolio demo, not
      research-grade prompt-injection defense)
   3. Per-session rate limit - prevents rapid-fire accidental spam
-  4. Global daily rate limit (file-based) - protects the shared Groq
-     quota from abuse once this is deployed publicly, since per-session
-     limits alone can be bypassed by opening multiple sessions/tabs
+  4. Global daily rate limit (file-based, LOCKED) - protects the shared
+     Groq quota from abuse once this is deployed publicly. The lock is
+     what makes this atomic: without it, two simultaneous requests could
+     both read the count before either writes it back, letting both
+     through even after the daily cap was reached - a real race
+     condition once traffic is genuinely concurrent, not a theoretical one.
 """
 
 import streamlit as st
@@ -25,6 +28,7 @@ import json
 import time
 from pathlib import Path
 from datetime import date
+from filelock import FileLock
 import sys
 sys.path.insert(0, ".")
 
@@ -33,6 +37,7 @@ from generate import run_and_save, client
 
 MIN_SECONDS_BETWEEN_REQUESTS = 3
 DAILY_LIMIT_FILE = Path("daily_request_count.json")
+DAILY_LIMIT_LOCK = Path("daily_request_count.lock")
 MAX_DAILY_REQUESTS = 200  # generous for a public demo, protects shared Groq quota
 
 
@@ -131,27 +136,28 @@ def sanitize_query(query: str, max_length: int = 500) -> tuple:
 def check_and_increment_global_limit() -> bool:
     """
     Global, file-based daily request counter - shared across ALL
-    sessions/users, not just one browser tab. This is what actually
-    protects the shared Groq quota once this app is public, since
-    per-session limits alone can be trivially bypassed by opening
-    multiple sessions.
+    sessions/users, not just one browser tab. Wrapped in a FileLock
+    to make the read-check-write sequence ATOMIC: without this lock,
+    two simultaneous requests could both read the count before either
+    writes it back, letting both through even at the cap.
     """
-    today = str(date.today())
+    with FileLock(str(DAILY_LIMIT_LOCK), timeout=5):
+        today = str(date.today())
 
-    if DAILY_LIMIT_FILE.exists():
-        data = json.loads(DAILY_LIMIT_FILE.read_text())
-    else:
-        data = {"date": today, "count": 0}
+        if DAILY_LIMIT_FILE.exists():
+            data = json.loads(DAILY_LIMIT_FILE.read_text())
+        else:
+            data = {"date": today, "count": 0}
 
-    if data["date"] != today:
-        data = {"date": today, "count": 0}
+        if data["date"] != today:
+            data = {"date": today, "count": 0}
 
-    if data["count"] >= MAX_DAILY_REQUESTS:
-        return False
+        if data["count"] >= MAX_DAILY_REQUESTS:
+            return False
 
-    data["count"] += 1
-    DAILY_LIMIT_FILE.write_text(json.dumps(data))
-    return True
+        data["count"] += 1
+        DAILY_LIMIT_FILE.write_text(json.dumps(data))
+        return True
 
 
 # ============================================================

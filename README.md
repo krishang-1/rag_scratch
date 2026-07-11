@@ -209,6 +209,18 @@ python -m streamlit run app.py --server.fileWatcherType none  # launch the demo
 
 ---
 
+### A Second, Distinct Faithfulness Failure Mode: Over-Strict Rejection
+
+Beyond the hallucination-catching case (see above), a different failure mode was found and documented: the independent faithfulness verifier occasionally rejects **genuinely well-grounded answers** when the phrasing includes reasonable summarizing language not verbatim in the source text.
+
+**Example:** asked "How does functools help with daily workflow?", the generator answered *"functools helps with daily workflow by providing functions for partial function application, memoization, and function wrapping"* — every factual claim here (`partial function application`, `memoization`, `function wrapping`) is directly traceable to the retrieved `partial`, `lru_cache`, and `update_wrapper` documentation. The verifier rejected the entire answer anyway, because the connective phrase *"helps with daily workflow"* (a natural paraphrase of the user's own question, not a factual claim) has no literal source in the documentation.
+
+**Root cause:** the verifier checks for word-for-word traceability too strictly, unable to distinguish stylistic/connective framing from substantive factual claims requiring grounding.
+
+**Why this wasn't patched:** this is the conservative side of a deliberate tradeoff — the system is designed to prefer false refusals over false hallucinations. Batch validation (`batch_faithfulness.py`) confirmed zero false positives on the 12-question hand-curated eval set, so this appears to be a real but bounded edge case on broader, multi-function questions rather than a systemic failure. Documented as an honest, known limitation rather than chased with further prompt engineering.
+
+---
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
